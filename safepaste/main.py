@@ -1,1 +1,0 @@
-# SafePaste - Main entry point
