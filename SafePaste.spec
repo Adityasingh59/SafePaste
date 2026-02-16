@@ -1,12 +1,29 @@
 # -*- mode: python ; coding: utf-8 -*-
-from PyInstaller.utils.hooks import collect_data_files, collect_submodules
+from PyInstaller.utils.hooks import collect_data_files, collect_submodules, copy_metadata
+import sys
+import os
 
 block_cipher = None
 
-# Collect Presidio and spaCy data
+# Collect data files
 datas = []
-# hiddenimports = collect_submodules('presidio_analyzer') + collect_submodules('customtkinter')
-hiddenimports = ['presidio_analyzer', 'customtkinter', 'pystray', 'PIL', 'spacy']
+datas += collect_data_files('customtkinter')
+datas += collect_data_files('presidio_analyzer')
+datas += copy_metadata('presidio_analyzer')
+datas += copy_metadata('presidio_anonymizer')
+datas += collect_data_files('en_core_web_lg')
+datas += copy_metadata('en_core_web_lg')
+datas += copy_metadata('spacy')
+
+# Hidden imports
+hiddenimports = [
+    'presidio_analyzer', 
+    'customtkinter', 
+    'pystray', 
+    'PIL', 
+    'spacy', 
+    'en_core_web_lg'
+]
 
 a = Analysis(
     ['main.py'],
@@ -28,28 +45,22 @@ pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 exe = EXE(
     pyz,
     a.scripts,
+    a.binaries,
+    a.zipfiles,
+    a.datas,
     [],
-    exclude_binaries=True,
     name='SafePaste',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
-    console=False, # Windowed application (no console)
+    upx_exclude=[],
+    runtime_tmpdir=None,
+    console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon='safepaste/icon.ico' if False else None # Placeholder for icon
-)
-coll = COLLECT(
-    exe,
-    a.binaries,
-    a.zipfiles,
-    a.datas,
-    strip=False,
-    upx=True,
-    upx_exclude=[],
-    name='SafePaste',
+    icon='safepaste/icon.ico' if False else None # Placeholder
 )

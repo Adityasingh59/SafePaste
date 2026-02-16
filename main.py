@@ -1,5 +1,9 @@
 import logging
 import threading
+import multiprocessing
+import ctypes
+from ctypes import wintypes
+import sys
 import pystray
 from PIL import Image, ImageDraw
 import customtkinter as ctk
@@ -18,10 +22,29 @@ from safepaste.ui_settings import SettingsWindow
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+def enforce_single_instance():
+    """
+    Ensure only one instance of the application is running using a Named Mutex.
+    """
+    kernel32 = ctypes.windll.kernel32
+    mutex_name = "Global\\SafePaste_Instance_Mutex_v1"
+    
+    # CreateMutexW returns a handle if it exists, but GetLastError will be ERROR_ALREADY_EXISTS
+    mutex = kernel32.CreateMutexW(None, False, mutex_name)
+    last_error = kernel32.GetLastError()
+    
+    if last_error == 183:  # ERROR_ALREADY_EXISTS
+        logger.error("Another instance of SafePaste is already running.")
+        sys.exit(0)
+    
+    return mutex
+
 class SafePasteApp:
     def __init__(self):
         self.config = Config()
         self.vault = Vault(ttl_seconds=self.config.vault_ttl)
+        # Initialize detector lazily or here? 
+        # Here is fine, but it takes RAM. 
         self.detector = PiiDetector()
         self.pseudonymizer = Pseudonymizer(self.vault)
         self.monitor = ClipboardMonitor(callback=self.handle_clipboard_change, interval=0.5)
@@ -38,47 +61,61 @@ class SafePasteApp:
     def handle_clipboard_change(self, content: str):
         """
         Called by ClipboardMonitor thread when clipboard changes.
-        We must schedule UI updates on the main thread.
-        """
-        if self.root:
-            self.root.after(0, self._process_clipboard_content, content)
-
-    def _process_clipboard_content(self, content: str):
-        """
-        Running on Main Thread.
-        Process content, check for re-hydration or PII.
+        CRITICAL: Perform Heavy Detection HERE (Background Thread) to avoid freezing Main UI Thread.
+        Only schedule UI updates via root.after.
         """
         if self.is_paused:
             return
 
-        # 1. Re-hydration
-        if "[" in content and "]" in content:
-            # Try re-hydration
-            restored = self.pseudonymizer.rehydrate(content)
-            if restored != content:
-                logger.info("Restored sensitive data from clipboard.")
-                self.monitor.update_last_content(restored)
-                pyperclip.copy(restored)
-                if self.icon:
-                    self.icon.notify("Restored original sensitive data.", "SafePaste")
+        try:
+            # 1. Re-hydration
+            if "[" in content and "]" in content:
+                # Try re-hydration
+                restored = self.pseudonymizer.rehydrate(content)
+                if restored != content:
+                    logger.info("Restored sensitive data from clipboard.")
+                    self.monitor.update_last_content(restored)
+                    
+                    # Clipboard write must be careful with threads, but usually fine.
+                    # Ideally, do this on main thread if pyperclip has issues, but it usually works.
+                    # We will schedule it to be safe and consistent.
+                    if self.root:
+                        self.root.after(0, self._perform_clipboard_update, restored, "Restored original sensitive data.")
+                    return
+
+            # 2. Filtering (Length check)
+            if len(content) < self.config.min_text_length:
                 return
 
-        # 2. Filtering (Length check)
-        if len(content) < self.config.min_text_length:
-            return
-
-        # 3. PII Detection
-        results = self.detector.detect(content)
-        if results:
-            logger.info(f"Detected {len(results)} PII entities.")
-            scrubbed_text = self.pseudonymizer.pseudonymize(content, results)
+            # 3. PII Detection (Heavy Operation)
+            # This blocks the monitor thread, not the UI thread. Perfect.
+            results = self.detector.detect(content)
             
-            # Show Review Window
-            self.show_review_window(content, scrubbed_text)
+            if results:
+                logger.info(f"Detected {len(results)} PII entities.")
+                scrubbed_text = self.pseudonymizer.pseudonymize(content, results)
+                
+                # Show Review Window (Must be on Main Thread)
+                if self.root:
+                    self.root.after(0, self.show_review_window, content, scrubbed_text)
+                    
+        except Exception as e:
+            logger.error(f"Error in background processing: {e}", exc_info=True)
+
+    def _perform_clipboard_update(self, text: str, notify_msg: Optional[str] = None):
+        """Helper to update clipboard from Main Thread."""
+        pyperclip.copy(text)
+        if notify_msg and self.icon:
+            self.icon.notify(notify_msg, "SafePaste")
 
     def show_review_window(self, original: str, scrubbed: str):
+        """Construct and show the review window on the Main Thread."""
+        # Check if window already exists
         if self.window_review and self.window_review.winfo_exists():
+            # If it exists, maybe update it? Or just bring to front?
+            # For now, let's just focus it. 
             self.window_review.lift()
+            self.window_review.focus_force()
             return
             
         self.window_review = ReviewWindow(
@@ -87,6 +124,10 @@ class SafePasteApp:
             on_copy=self.on_copy_clean,
             on_close=lambda: setattr(self, 'window_review', None)
         )
+        # Ensure it pops up over other windows
+        self.window_review.lift()
+        self.window_review.attributes("-topmost", True)
+        self.window_review.focus_force()
 
     def on_copy_clean(self, text: str):
         """User clicked 'Copy Clean' in dashboard."""
@@ -127,17 +168,27 @@ class SafePasteApp:
     def show_settings_window(self):
         if self.window_settings and self.window_settings.winfo_exists():
             self.window_settings.lift()
+            self.window_settings.focus_force()
             return
 
         self.window_settings = SettingsWindow(
             config=self.config,
             on_close_callback=lambda: setattr(self, 'window_settings', None)
         )
+        self.window_settings.lift()
+        self.window_settings.focus_force()
 
     def toggle_pause(self, icon, item):
         self.is_paused = not self.is_paused
-        # Update icon color? Pystray might need update_menu or icon replacement.
-        # Simple for now: just toggle logic.
+        state = "Paused" if self.is_paused else "Active"
+        color = (128, 128, 128) if self.is_paused else (0, 128, 0)
+        
+        # Update Icon visuals (simple color change)
+        img = Image.new('RGB', (64, 64), color=color)
+        d = ImageDraw.Draw(img)
+        d.rectangle([16, 16, 48, 48], fill=(255, 255, 255))
+        self.icon.icon = img
+        self.icon.title = f"SafePaste - {state}"
 
     def quit_app(self):
         logger.info("Quitting application...")
@@ -165,5 +216,11 @@ class SafePasteApp:
             self.quit_app()
 
 if __name__ == "__main__":
+    # CRITICAL: Fix for PyInstaller infinite spawn issue
+    multiprocessing.freeze_support()
+    
+    # CRITICAL: Singleton check
+    mutex = enforce_single_instance()
+    
     app = SafePasteApp()
     app.run()
