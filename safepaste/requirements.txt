@@ -1,7 +1,0 @@
-pyperclip
-presidio-analyzer
-spacy
-customtkinter
-pystray
-pillow
-pyinstaller

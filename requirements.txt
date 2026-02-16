@@ -1,0 +1,8 @@
+presidio-analyzer
+presidio-anonymizer
+spacy
+customtkinter
+pyperclip
+pystray
+Pillow
+pytest
